@@ -1,174 +1,158 @@
 
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
-import { Receipt, ReceiptItem } from "../types";
+import { Receipt, ReceiptItem } from "../types.ts";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-/**
- * Helper to wait for a specific amount of time
- */
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * Wrapper to handle API calls with exponential backoff for 429 errors
- */
+const getHistoricalContext = (history: Receipt[]) => {
+  if (!history || history.length === 0) return "";
+  
+  const storeSpecific: Record<string, Record<string, string>> = {};
+  const globalItems: Record<string, string> = {};
+
+  // Process history from newest to oldest to capture latest preference
+  [...history].reverse().forEach(r => {
+    const store = r.storeName.toLowerCase().trim();
+    if (!storeSpecific[store]) storeSpecific[store] = {};
+    
+    r.items.forEach(i => {
+      const itemName = i.name.toLowerCase().trim();
+      if (i.subcategory) {
+        if (!storeSpecific[store][itemName]) storeSpecific[store][itemName] = i.subcategory;
+        if (!globalItems[itemName]) globalItems[itemName] = i.subcategory;
+      }
+    });
+  });
+
+  const rules: string[] = [];
+  
+  // 1. Store-specific rules (high priority)
+  Object.entries(storeSpecific).slice(0, 15).forEach(([store, items]) => {
+    Object.entries(items).slice(0, 5).forEach(([item, sub]) => {
+      rules.push(`- Store: "${store}" | Item: "${item}" -> Subcategory: "${sub}"`);
+    });
+  });
+
+  // 2. Global item rules (fallback)
+  Object.entries(globalItems).slice(0, 20).forEach(([item, sub]) => {
+    rules.push(`- Global | Item: "${item}" -> Subcategory: "${sub}"`);
+  });
+
+  if (rules.length === 0) return "";
+
+  return `
+HISTORICAL SUBCATEGORY PREFERENCES (Follow these rules strictly for consistency):
+${rules.join('\n')}
+  `.trim();
+};
+
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
   let lastError: any;
   for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await fn();
-    } catch (err: any) {
+    try { return await fn(); }
+    catch (err: any) {
       lastError = err;
-      const isRateLimit = String(err).includes("429") || 
-                          String(err).toLowerCase().includes("quota") || 
-                          String(err).toLowerCase().includes("exhausted");
-      
-      if (isRateLimit && i < maxRetries - 1) {
-        const waitTime = Math.pow(2, i + 1) * 1000;
-        console.warn(`Rate limit hit. Retrying in ${waitTime}ms... (Attempt ${i + 1}/${maxRetries})`);
-        await sleep(waitTime);
-        continue;
-      }
+      if (String(err).includes("429") && i < maxRetries - 1) { await sleep(Math.pow(2, i + 1) * 1000); continue; }
       throw err;
     }
   }
   throw lastError;
 }
 
-/**
- * Validates and corrects item prices based on the reported total.
- */
-const sanitizeExtractedData = (data: any): Partial<Receipt> => {
-  if (!data.items || !Array.isArray(data.items)) return data;
+const sanitizeExtractedData = (data: any): Partial<Receipt> => ({
+  type: data.type === 'refund' ? 'refund' : 'purchase',
+  storeName: String(data.storeName || 'Unknown Merchant'),
+  date: String(data.date || new Date().toISOString().split('T')[0]),
+  total: Number(data.total) || 0,
+  currency: String(data.currency || 'USD'),
+  items: Array.isArray(data.items) ? data.items.map((i: any) => ({ 
+    name: String(i.name || 'Item'), 
+    quantity: Number(i.quantity) || 1, 
+    price: Number(i.price) || 0, 
+    category: String(i.category || 'General'), 
+    subcategory: String(i.subcategory || '') 
+  })) : []
+});
 
-  const reportedTotal = data.total || 0;
+const PROMPT_CORE = `Extract receipt data accurately. Cross-verify quantities and unit prices against the total. Identify taxes as category 'fee'. Use the provided historical preferences for subcategories to ensure 100% consistency with previous labels. If a new item doesn't have a rule, categorize it logically based on similar existing rules. Return valid JSON.`;
+
+export const extractReceiptData = async (base64Image: string, history: Receipt[] = []): Promise<Partial<Receipt>> => {
+  const model = 'gemini-flash-lite-latest';
+  const historyText = getHistoricalContext(history);
+  const prompt = `Extract receipt data from image. ${PROMPT_CORE}\n\n${historyText}`;
   
-  const correctedItems = data.items.map((item: any) => {
-    const qty = item.quantity || 1;
-    const price = item.price || 0;
-    const lineTotal = item.lineTotal || (price * qty);
-
-    let correctedPrice = price;
-    if (qty > 1 && Math.abs(price - lineTotal) < 0.01 && price > 0) {
-      correctedPrice = price / qty;
-    }
-
-    return {
-      ...item,
-      price: correctedPrice,
-      quantity: qty
-    };
-  });
-
-  const calculatedSum = correctedItems.reduce((sum, i) => sum + (i.price * i.quantity), 0);
-  if (calculatedSum > reportedTotal * 1.5 && reportedTotal > 0) {
-    correctedItems.forEach(item => {
-      if (item.quantity > 1) {
-        item.price = item.price / item.quantity;
-      }
+  return withRetry(async () => {
+    const res = await ai.models.generateContent({ 
+      model, 
+      contents: { 
+        parts: [
+          { inlineData: { mimeType: 'image/jpeg', data: base64Image } }, 
+          { text: prompt }
+        ] 
+      }, 
+      config: { responseMimeType: "application/json" } 
     });
-  }
-
-  return { ...data, items: correctedItems };
+    return sanitizeExtractedData(JSON.parse(res.text || '{}'));
+  });
 };
 
-export const extractReceiptData = async (base64Image: string): Promise<Partial<Receipt>> => {
-  // Using flash-lite for higher quota during batch processing
-  const model = 'gemini-flash-lite-latest';
-  
-  const prompt = `You are a world-class financial auditor. Extract data from this receipt with surgical precision.
-  
-  FIELD INSTRUCTIONS:
-  1. type: 'purchase' or 'refund'.
-  2. storeName: The trade name of the merchant.
-  3. items: Array of objects. For each item:
-     - name: Descriptive product name.
-     - quantity: Number of units.
-     - price: THE UNIT PRICE (Price for exactly ONE unit).
-     - lineTotal: The total cost for that line (qty * unit price).
-     - category: High-level group (e.g., Groceries, Dining, Electronics, Health, Apparel, Home).
-     - subcategory: Specific type (e.g., Dairy, Produce, Fast Food, Pharmacy, Cleaning Supplies).
-  
-  CRITICAL MATH LOGIC:
-  - If a receipt shows "2 @ 5.00 ... 10.00", the 'price' is 5.00 and 'quantity' is 2.
-  - If it ONLY shows "2 x MILK ... 12.00", you MUST divide 12 by 2 and set 'price' to 6.00.
-  - DO NOT put the total line cost in the 'price' field if quantity is > 1.
-  
-  INTELLIGENT CATEGORIZATION:
-  - Use the Store Name and Item Name to determine the most logical Category and Subcategory. 
-  - Be specific. "Grocery > Produce" is better than just "Food".
-  
-  Return strictly valid JSON.`;
+export const processCSVData = async (csvSnippet: string): Promise<Partial<Receipt>[]> => {
+  const model = 'gemini-3-flash-preview';
+  const prompt = `Convert the following CSV data into an array of SpendWise Receipt objects. 
+  Logic: Identify which columns represent Store Name, Date, Total, and optionally Item Names/Prices.
+  Return an array of objects matching this schema: 
+  [{ 
+    "storeName": string, 
+    "date": string (YYYY-MM-DD), 
+    "total": number, 
+    "type": "purchase" | "refund",
+    "items": [{ "name": string, "price": number, "quantity": number, "category": string, "subcategory": string }]
+  }]
+  CSV DATA:
+  ${csvSnippet}`;
 
   return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-          { text: prompt }
-        ]
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            type: { type: Type.STRING, enum: ['purchase', 'refund'] },
-            storeName: { type: Type.STRING },
-            date: { type: Type.STRING },
-            total: { type: Type.NUMBER },
-            currency: { type: Type.STRING },
-            items: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  quantity: { type: Type.NUMBER },
-                  price: { type: Type.NUMBER, description: "Unit price for 1 item" },
-                  lineTotal: { type: Type.NUMBER, description: "Total for line (qty * price)" },
-                  category: { type: Type.STRING },
-                  subcategory: { type: Type.STRING }
-                },
-                required: ["name", "quantity", "price", "category", "subcategory"]
-              }
-            }
-          },
-          required: ["type", "storeName", "date", "total", "items"]
-        }
-      }
-    });
+    const res = await ai.models.generateContent({ model, contents: prompt, config: { responseMimeType: "application/json" } });
+    const parsed = JSON.parse(res.text || '[]');
+    return Array.isArray(parsed) ? parsed.map(sanitizeExtractedData) : [];
+  });
+};
 
-    const rawData = JSON.parse(response.text || '{}');
-    return sanitizeExtractedData(rawData);
+export const extractEmailData = async (text: string, history: Receipt[] = []): Promise<Partial<Receipt>> => {
+  const model = 'gemini-3-flash-preview';
+  const historyText = getHistoricalContext(history);
+  const prompt = `Extract receipt data from email content. ${PROMPT_CORE}\n\n${historyText}`;
+  
+  return withRetry(async () => {
+    const res = await ai.models.generateContent({ 
+      model, 
+      contents: [
+        { text: prompt }, 
+        { text }
+      ], 
+      config: { responseMimeType: "application/json" } 
+    });
+    return sanitizeExtractedData(JSON.parse(res.text || '{}'));
   });
 };
 
 export const chatWithHistory = async (history: Receipt[], userQuestion: string): Promise<string> => {
   const model = 'gemini-3-flash-preview';
-  
-  const context = JSON.stringify(history.map(r => ({
-    type: r.type,
-    store: r.storeName,
-    date: r.date,
-    total: r.total,
-    items: r.items
+  const context = JSON.stringify(history.map(r => ({ 
+    s: r.storeName, 
+    d: r.date, 
+    t: r.total, 
+    i: r.items.map(item => ({ n: item.name, p: item.price, c: item.category, sc: item.subcategory })) 
   })));
-
-  const systemPrompt = `You are SpendWise AI, a financial assistant. 
-  History: ${context}. 
-  Provide helpful, accurate summaries and answers. Use Markdown. If asked about trends, look at categories and subcategories.`;
-
+  
   return withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model,
-      contents: userQuestion,
-      config: {
-        systemInstruction: systemPrompt,
-        temperature: 0.7,
-      }
+    const res = await ai.models.generateContent({ 
+      model, 
+      contents: userQuestion, 
+      config: { systemInstruction: `You are SpendWise AI, a financial assistant. Use the following context for analysis: ${context}. Help the user reconcile and understand their spending.` } 
     });
-    return response.text || "I couldn't process that.";
+    return res.text || "I couldn't process that.";
   });
 };

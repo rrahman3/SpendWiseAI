@@ -12,12 +12,16 @@ export interface Receipt {
   type: 'purchase' | 'refund';
   storeName: string;
   date: string;
+  /** Fix: Added time for perfectly unique transaction identification */
+  time?: string; 
   total: number;
   items: ReceiptItem[];
   currency: string;
   rawText?: string;
   imageUrl?: string;
   createdAt: number;
+  /** Added source property to distinguish between scan, email, or csv sources */
+  source?: 'scan' | 'email' | 'csv';
 }
 
 export interface UserProfile {
@@ -28,9 +32,12 @@ export interface UserProfile {
   totalSpent: number;
   receiptCount: number;
   isAuthenticated: boolean;
+  isVerified?: boolean;
 }
 
-export type View = 'dashboard' | 'scan' | 'history' | 'items' | 'chat' | 'profile';
+export type View = 'dashboard' | 'scan' | 'history' | 'items' | 'chat' | 'profile' | 'csv-import' | 'duplicate-review';
+export type PublicView = 'home' | 'pricing' | 'blog' | 'contact' | 'login';
+export type AuthView = 'sign-in' | 'sign-up' | 'forgot-password' | 'verify-email';
 
 export interface ChatMessage {
   role: 'user' | 'model';
