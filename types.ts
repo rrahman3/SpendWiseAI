@@ -4,10 +4,12 @@ export interface ReceiptItem {
   quantity: number;
   price: number;
   category?: string;
+  subcategory?: string;
 }
 
 export interface Receipt {
   id: string;
+  type: 'purchase' | 'refund';
   storeName: string;
   date: string;
   total: number;
@@ -19,14 +21,16 @@ export interface Receipt {
 }
 
 export interface UserProfile {
+  id: string;
   name: string;
   email: string;
   avatar: string;
   totalSpent: number;
   receiptCount: number;
+  isAuthenticated: boolean;
 }
 
-export type View = 'dashboard' | 'scan' | 'history' | 'insights' | 'chat';
+export type View = 'dashboard' | 'scan' | 'history' | 'items' | 'chat' | 'profile';
 
 export interface ChatMessage {
   role: 'user' | 'model';
